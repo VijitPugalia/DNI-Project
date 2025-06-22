@@ -1,74 +1,139 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <Adafruit_NeoPixel.h>
+#include <Arduino_JSON.h>
 
-#define LED_PIN     5
-#define LED_COUNT   21  // Using only 20 LEDs
+// WiFi credentials
+const char* ssid = "570 Lygon";
+const char* password = "Pass@112";
 
-Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-String input = "";
+// LED setup
+#define LED_PIN 5
+#define NUM_LEDS 40
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Button pins
+const int switchPin1 = 15;
+const int switchPin2 = 32;
+const int switchPin3 = 14;
+const int switchPin4 = 20;
+const int switchPin5 = 22;
+
+// Web server and SSE
+AsyncWebServer server(80);
+AsyncEventSource events("/events");
+
+// Timing for stream updates
+unsigned long lastUpdate = 0;
+const unsigned long updateInterval = 20;
+
+// Convert hex to byte
+uint8_t hexToByte(const String &hex) {
+  return (uint8_t) strtoul(hex.c_str(), nullptr, 16);
+}
+
+// Named color to RGB
+uint32_t getNamedColor(const String& name) {
+  String color = name;
+  color.toLowerCase();
+  if (color == "red") return strip.Color(255, 0, 0);
+  if (color == "green") return strip.Color(0, 255, 0);
+  if (color == "blue") return strip.Color(0, 0, 255);
+  if (color == "yellow") return strip.Color(255, 255, 0);
+  if (color == "magenta") return strip.Color(255, 0, 255);
+  if (color == "cyan") return strip.Color(0, 255, 255);
+  if (color == "white") return strip.Color(255, 255, 255);
+  if (color == "black" || color == "off") return strip.Color(0, 0, 0);
+  if (color == "orange") return strip.Color(255, 165, 0);
+  if (color == "purple") return strip.Color(128, 0, 128);
+  return strip.Color(0, 0, 0);
+}
+
+// Read button states and return as JSON string
+String getButtonStates() {
+  JSONVar states;
+  states["button1"] = digitalRead(switchPin1) == LOW ? "true" : "false";
+  states["button2"] = digitalRead(switchPin2) == LOW ? "true" : "false";
+  states["button3"] = digitalRead(switchPin3) == LOW ? "true" : "false";
+  states["button4"] = digitalRead(switchPin4) == LOW ? "true" : "false";
+  states["button5"] = digitalRead(switchPin5) == LOW ? "true" : "false";
+  return JSON.stringify(states);
+}
 
 void setup() {
   Serial.begin(115200);
   strip.begin();
-  strip.setBrightness(100);
+  strip.clear();
   strip.show();
-  Serial.println("Control 21 LEDs with:");
-  Serial.println("1 red | 2 blue | 3 #00FF00 | 1 off | all off");
+
+  // Setup buttons as pullups
+  pinMode(switchPin1, INPUT_PULLUP);
+  pinMode(switchPin2, INPUT_PULLUP);
+  pinMode(switchPin3, INPUT_PULLUP);
+  pinMode(switchPin4, INPUT_PULLUP);
+  pinMode(switchPin5, INPUT_PULLUP);
+
+  // WiFi connect
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // LED color set endpoint
+  server.on("/leds", HTTP_GET, [](AsyncWebServerRequest *request) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      String param = "rgb" + String(i);
+      if (request->hasParam(param)) {
+        String value = request->getParam(param)->value();
+        value.trim();
+        value.toUpperCase();
+
+        if (value.length() == 6) {
+          uint8_t r = hexToByte(value.substring(0, 2));
+          uint8_t g = hexToByte(value.substring(2, 4));
+          uint8_t b = hexToByte(value.substring(4, 6));
+          strip.setPixelColor(i, strip.Color(r, g, b));
+        } else {
+          strip.setPixelColor(i, getNamedColor(value));
+        }
+      }
+    }
+    strip.show();
+    request->send(200, "text/plain", "LEDs updated");
+  });
+
+  // Turn off all LEDs
+  server.on("/alloff", HTTP_GET, [](AsyncWebServerRequest *request) {
+    strip.clear();
+    strip.show();
+    request->send(200, "text/plain", "All LEDs turned off");
+  });
+
+  // Serve button states as JSON
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", getButtonStates());
+  });
+
+  // Server-Sent Events
+  events.onConnect([](AsyncEventSourceClient *client) {
+    Serial.println("Client connected to /events");
+    client->send("connected", NULL, millis(), 10000);
+  });
+  server.addHandler(&events);
+
+  server.begin();
 }
 
 void loop() {
-  if (Serial.available()) {
-    input = Serial.readStringUntil('\n');
-    input.trim();
-    input.toLowerCase();
-
-    if (input == "all off") {
-      for (int i = 0; i < LED_COUNT; i++) {
-        strip.setPixelColor(i, 0);  // Off
-      }
-      strip.show();
-      Serial.println("All LEDs turned off.");
-      return;
-    }
-
-    int spaceIndex = input.indexOf(' ');
-    if (spaceIndex == -1) {
-      Serial.println("Invalid input. Format: <LED#> <color>");
-      return;
-    }
-
-    int ledIndex = input.substring(0, spaceIndex).toInt() - 1;  // Adjust for 1-based input
-    String colorStr = input.substring(spaceIndex + 1);
-
-    if (ledIndex < 0 || ledIndex >= LED_COUNT) {
-      Serial.println("LED number must be between 1 and 20.");
-      return;
-    }
-
-    if (colorStr == "off") {
-      strip.setPixelColor(ledIndex, 0);
-    } else if (colorStr.startsWith("#") && colorStr.length() == 7) {
-      long hexColor = strtol(colorStr.substring(1).c_str(), NULL, 16);
-      uint8_t r = (hexColor >> 16) & 0xFF;
-      uint8_t g = (hexColor >> 8) & 0xFF;
-      uint8_t b = hexColor & 0xFF;
-      strip.setPixelColor(ledIndex, strip.Color(r, g, b));
-    } else {
-      uint32_t namedColor = getColorFromName(colorStr);
-      strip.setPixelColor(ledIndex, namedColor);
-    }
-
-    strip.show();
+  if (millis() - lastUpdate > updateInterval) {
+    String stateData = getButtonStates();
+    events.send(stateData.c_str(), "button_state", millis());
+    lastUpdate = millis();
   }
-}
-
-uint32_t getColorFromName(String name) {
-  if (name == "red") return strip.Color(255, 0, 0);
-  if (name == "green") return strip.Color(0, 255, 0);
-  if (name == "blue") return strip.Color(0, 0, 255);
-  if (name == "yellow") return strip.Color(255, 255, 0);
-  if (name == "orange") return strip.Color(255, 165, 0);
-  if (name == "white") return strip.Color(255, 255, 255);
-  if (name == "purple") return strip.Color(128, 0, 128);
-  if (name == "pink") return strip.Color(255, 105, 180);
-  return 0; // Unknown color = off
 }
